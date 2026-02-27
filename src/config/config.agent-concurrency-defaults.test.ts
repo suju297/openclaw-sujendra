@@ -46,6 +46,20 @@ describe("agent concurrency defaults", () => {
     expect(parsed.agents?.defaults?.subagents?.maxChildrenPerAgent).toBe(7);
   });
 
+  it("accepts subagent spawn gateway timeout config", () => {
+    const parsed = OpenClawSchema.parse({
+      agents: {
+        defaults: {
+          subagents: {
+            spawnTimeoutMs: 45_000,
+          },
+        },
+      },
+    });
+
+    expect(parsed.agents?.defaults?.subagents?.spawnTimeoutMs).toBe(45_000);
+  });
+
   it("injects defaults on load", async () => {
     await withTempHome(async (home) => {
       const configDir = path.join(home, ".openclaw");

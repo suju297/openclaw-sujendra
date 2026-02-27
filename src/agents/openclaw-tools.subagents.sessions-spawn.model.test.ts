@@ -11,6 +11,7 @@ import { resetSubagentRegistryForTests } from "./subagent-registry.js";
 import {
   SUBAGENT_SPAWN_ACCEPTED_NOTE,
   SUBAGENT_SPAWN_GATEWAY_TIMEOUT_MS,
+  SUBAGENT_SPAWN_TIMEOUT_ACTIONABLE_ERROR,
 } from "./subagent-spawn.js";
 
 const callGatewayMock = getCallGatewayMock();
@@ -342,5 +343,138 @@ describe("openclaw-tools: subagents (sessions_spawn model + thinking)", () => {
     for (const call of spawnCalls) {
       expect(call.timeoutMs).toBe(SUBAGENT_SPAWN_GATEWAY_TIMEOUT_MS);
     }
+  });
+
+  it("uses configured subagents.spawnTimeoutMs when provided", async () => {
+    setSessionsSpawnConfigOverride({
+      session: { mainKey: "main", scope: "per-sender" },
+      agents: {
+        defaults: {
+          subagents: {
+            spawnTimeoutMs: 45_000,
+          },
+        },
+      },
+    });
+
+    const calls: GatewayCall[] = [];
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as GatewayCall;
+      calls.push(request);
+      if (request.method === "agent") {
+        return { runId: "run-config-timeout", status: "accepted" };
+      }
+      return {};
+    });
+
+    const tool = await getSessionsSpawnTool({
+      agentSessionKey: "main",
+      agentChannel: "whatsapp",
+    });
+
+    const result = await tool.execute("call-config-timeout", {
+      task: "do thing",
+      model: "minimax/MiniMax-M2.1",
+    });
+    expect(result.details).toMatchObject({
+      status: "accepted",
+      runId: "run-config-timeout",
+    });
+
+    const spawnCalls = calls.filter(
+      (call) => call.method === "sessions.patch" || call.method === "agent",
+    );
+    expect(spawnCalls.length).toBeGreaterThan(0);
+    for (const call of spawnCalls) {
+      expect(call.timeoutMs).toBe(45_000);
+    }
+  });
+
+  it("retries once on timeout and succeeds on second attempt", async () => {
+    const calls: GatewayCall[] = [];
+    let agentCalls = 0;
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as GatewayCall;
+      calls.push(request);
+      if (request.method === "agent") {
+        agentCalls += 1;
+        if (agentCalls === 1) {
+          throw new Error("gateway timeout after 30000ms");
+        }
+        return { runId: "run-retry", status: "accepted" };
+      }
+      return {};
+    });
+
+    const tool = await getSessionsSpawnTool({
+      agentSessionKey: "main",
+      agentChannel: "whatsapp",
+    });
+    const result = await tool.execute("call-timeout-retry", {
+      task: "do thing",
+    });
+
+    expect(result.details).toMatchObject({
+      status: "accepted",
+      runId: "run-retry",
+    });
+    expect(agentCalls).toBe(2);
+    const agentRequests = calls.filter((call) => call.method === "agent");
+    const firstParams = agentRequests[0]?.params as { idempotencyKey?: string } | undefined;
+    const secondParams = agentRequests[1]?.params as { idempotencyKey?: string } | undefined;
+    expect(firstParams?.idempotencyKey).toBeTruthy();
+    expect(secondParams?.idempotencyKey).toBe(firstParams?.idempotencyKey);
+  });
+
+  it("does not retry non-timeout spawn failures", async () => {
+    let agentCalls = 0;
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as GatewayCall;
+      if (request.method === "agent") {
+        agentCalls += 1;
+        throw new Error("unauthorized");
+      }
+      return {};
+    });
+
+    const tool = await getSessionsSpawnTool({
+      agentSessionKey: "main",
+      agentChannel: "whatsapp",
+    });
+    const result = await tool.execute("call-no-retry", {
+      task: "do thing",
+    });
+
+    expect(result.details).toMatchObject({
+      status: "error",
+      error: "unauthorized",
+    });
+    expect(agentCalls).toBe(1);
+  });
+
+  it("returns actionable timeout error after retry is exhausted", async () => {
+    let agentCalls = 0;
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as GatewayCall;
+      if (request.method === "agent") {
+        agentCalls += 1;
+        throw new Error("gateway timeout after 30000ms");
+      }
+      return {};
+    });
+
+    const tool = await getSessionsSpawnTool({
+      agentSessionKey: "main",
+      agentChannel: "whatsapp",
+    });
+    const result = await tool.execute("call-timeout-fail", {
+      task: "do thing",
+    });
+
+    expect(result.details).toMatchObject({
+      status: "error",
+      error: SUBAGENT_SPAWN_TIMEOUT_ACTIONABLE_ERROR,
+    });
+    expect(agentCalls).toBe(2);
   });
 });

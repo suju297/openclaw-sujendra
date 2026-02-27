@@ -3,6 +3,7 @@ import { formatThinkingLevels, normalizeThinkLevel } from "../auto-reply/thinkin
 import { DEFAULT_SUBAGENT_MAX_SPAWN_DEPTH } from "../config/agent-limits.js";
 import { loadConfig } from "../config/config.js";
 import { callGateway } from "../gateway/call.js";
+import { createSubsystemLogger } from "../logging/subsystem.js";
 import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
 import {
   isCronSessionKey,
@@ -56,6 +57,20 @@ export const SUBAGENT_SPAWN_ACCEPTED_NOTE =
 export const SUBAGENT_SPAWN_SESSION_ACCEPTED_NOTE =
   "thread-bound session stays active after this task; continue in-thread for follow-ups.";
 export const SUBAGENT_SPAWN_GATEWAY_TIMEOUT_MS = 30_000;
+export const SUBAGENT_SPAWN_TIMEOUT_ACTIONABLE_ERROR =
+  "Sub-agent spawn timed out. The gateway may be busy. Try running the task directly or wait and retry.";
+
+const subagentSpawnLog = createSubsystemLogger("agent/sessions-spawn");
+const MAX_TIMER_SAFE_TIMEOUT_MS = 2_147_483_647;
+const SUBAGENT_SPAWN_MAX_ATTEMPTS = 2;
+const SUBAGENT_SPAWN_RETRY_DELAY_MS = process.env.VITEST === "true" ? 8 : 2_000;
+const SPAWN_TIMEOUT_ERROR_PATTERNS: readonly RegExp[] = [
+  /gateway timeout/i,
+  /\btimed out\b/i,
+  /\betimedout\b/i,
+  /gateway closed \(1006/i,
+  /\bclose code 1006\b/i,
+];
 
 export type SpawnSubagentResult = {
   status: "accepted" | "forbidden" | "error";
@@ -101,6 +116,26 @@ function summarizeError(err: unknown): string {
     return err;
   }
   return "error";
+}
+
+function resolveSpawnGatewayTimeoutMs(cfg: ReturnType<typeof loadConfig>): number {
+  const configured = cfg.agents?.defaults?.subagents?.spawnTimeoutMs;
+  if (typeof configured !== "number" || !Number.isFinite(configured)) {
+    return SUBAGENT_SPAWN_GATEWAY_TIMEOUT_MS;
+  }
+  return Math.min(Math.max(1, Math.floor(configured)), MAX_TIMER_SAFE_TIMEOUT_MS);
+}
+
+function isSpawnTimeoutError(err: unknown): boolean {
+  const message = summarizeError(err);
+  return SPAWN_TIMEOUT_ERROR_PATTERNS.some((pattern) => pattern.test(message));
+}
+
+async function waitForSpawnRetryDelay(ms: number): Promise<void> {
+  if (ms <= 0) {
+    return;
+  }
+  await new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
 async function ensureThreadBindingForSubagentSpawn(params: {
@@ -212,6 +247,7 @@ export async function spawnSubagentDirect(
     typeof params.runTimeoutSeconds === "number" && Number.isFinite(params.runTimeoutSeconds)
       ? Math.max(0, Math.floor(params.runTimeoutSeconds))
       : cfgSubagentTimeout;
+  const spawnGatewayTimeoutMs = resolveSpawnGatewayTimeoutMs(cfg);
   let modelApplied = false;
   let threadBindingReady = false;
   const { mainKey, alias } = resolveMainSessionAlias(cfg);
@@ -301,7 +337,7 @@ export async function spawnSubagentDirect(
     await callGateway({
       method: "sessions.patch",
       params: { key: childSessionKey, spawnDepth: childDepth },
-      timeoutMs: SUBAGENT_SPAWN_GATEWAY_TIMEOUT_MS,
+      timeoutMs: spawnGatewayTimeoutMs,
     });
   } catch (err) {
     const messageText =
@@ -318,7 +354,7 @@ export async function spawnSubagentDirect(
       await callGateway({
         method: "sessions.patch",
         params: { key: childSessionKey, model: resolvedModel },
-        timeoutMs: SUBAGENT_SPAWN_GATEWAY_TIMEOUT_MS,
+        timeoutMs: spawnGatewayTimeoutMs,
       });
       modelApplied = true;
     } catch (err) {
@@ -339,7 +375,7 @@ export async function spawnSubagentDirect(
           key: childSessionKey,
           thinkingLevel: thinkingOverride === "off" ? null : thinkingOverride,
         },
-        timeoutMs: SUBAGENT_SPAWN_GATEWAY_TIMEOUT_MS,
+        timeoutMs: spawnGatewayTimeoutMs,
       });
     } catch (err) {
       const messageText =
@@ -371,7 +407,7 @@ export async function spawnSubagentDirect(
         await callGateway({
           method: "sessions.delete",
           params: { key: childSessionKey, emitLifecycleHooks: false },
-          timeoutMs: SUBAGENT_SPAWN_GATEWAY_TIMEOUT_MS,
+          timeoutMs: spawnGatewayTimeoutMs,
         });
       } catch {
         // Best-effort cleanup only.
@@ -406,34 +442,61 @@ export async function spawnSubagentDirect(
 
   const childIdem = crypto.randomUUID();
   let childRunId: string = childIdem;
-  try {
-    const response = await callGateway<{ runId: string }>({
-      method: "agent",
-      params: {
-        message: childTaskMessage,
-        sessionKey: childSessionKey,
-        channel: requesterOrigin?.channel,
-        to: requesterOrigin?.to ?? undefined,
-        accountId: requesterOrigin?.accountId ?? undefined,
-        threadId: requesterOrigin?.threadId != null ? String(requesterOrigin.threadId) : undefined,
-        idempotencyKey: childIdem,
-        deliver: false,
-        lane: AGENT_LANE_SUBAGENT,
-        extraSystemPrompt: childSystemPrompt,
-        thinking: thinkingOverride,
-        timeout: runTimeoutSeconds,
-        label: label || undefined,
-        spawnedBy: spawnedByKey,
-        groupId: ctx.agentGroupId ?? undefined,
-        groupChannel: ctx.agentGroupChannel ?? undefined,
-        groupSpace: ctx.agentGroupSpace ?? undefined,
-      },
-      timeoutMs: SUBAGENT_SPAWN_GATEWAY_TIMEOUT_MS,
-    });
-    if (typeof response?.runId === "string" && response.runId) {
-      childRunId = response.runId;
+  let startError: unknown;
+  for (let attempt = 1; attempt <= SUBAGENT_SPAWN_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      const response = await callGateway<{ runId: string }>({
+        method: "agent",
+        params: {
+          message: childTaskMessage,
+          sessionKey: childSessionKey,
+          channel: requesterOrigin?.channel,
+          to: requesterOrigin?.to ?? undefined,
+          accountId: requesterOrigin?.accountId ?? undefined,
+          threadId:
+            requesterOrigin?.threadId != null ? String(requesterOrigin.threadId) : undefined,
+          idempotencyKey: childIdem,
+          deliver: false,
+          lane: AGENT_LANE_SUBAGENT,
+          extraSystemPrompt: childSystemPrompt,
+          thinking: thinkingOverride,
+          timeout: runTimeoutSeconds,
+          label: label || undefined,
+          spawnedBy: spawnedByKey,
+          groupId: ctx.agentGroupId ?? undefined,
+          groupChannel: ctx.agentGroupChannel ?? undefined,
+          groupSpace: ctx.agentGroupSpace ?? undefined,
+        },
+        timeoutMs: spawnGatewayTimeoutMs,
+      });
+      if (typeof response?.runId === "string" && response.runId) {
+        childRunId = response.runId;
+      }
+      startError = undefined;
+      break;
+    } catch (err) {
+      const timeoutError = isSpawnTimeoutError(err);
+      if (timeoutError && attempt < SUBAGENT_SPAWN_MAX_ATTEMPTS) {
+        subagentSpawnLog.warn(
+          `sessions_spawn launch timed out (attempt ${attempt}/${SUBAGENT_SPAWN_MAX_ATTEMPTS}) for ${childSessionKey}; retrying in ${SUBAGENT_SPAWN_RETRY_DELAY_MS}ms: ${summarizeError(err)}`,
+        );
+        await waitForSpawnRetryDelay(SUBAGENT_SPAWN_RETRY_DELAY_MS);
+        continue;
+      }
+      startError = err;
+      const reason = summarizeError(err);
+      if (timeoutError) {
+        subagentSpawnLog.warn(
+          `sessions_spawn launch timed out after ${attempt} attempts for ${childSessionKey}: ${reason}`,
+        );
+      } else {
+        subagentSpawnLog.warn(`sessions_spawn launch failed for ${childSessionKey}: ${reason}`);
+      }
+      break;
     }
-  } catch (err) {
+  }
+
+  if (startError) {
     if (threadBindingReady) {
       const hasEndedHook = hookRunner?.hasHooks("subagent_ended") === true;
       let endedHookEmitted = false;
@@ -471,13 +534,15 @@ export async function spawnSubagentDirect(
             deleteTranscript: true,
             emitLifecycleHooks: !endedHookEmitted,
           },
-          timeoutMs: SUBAGENT_SPAWN_GATEWAY_TIMEOUT_MS,
+          timeoutMs: spawnGatewayTimeoutMs,
         });
       } catch {
         // Best-effort only.
       }
     }
-    const messageText = summarizeError(err);
+    const messageText = isSpawnTimeoutError(startError)
+      ? SUBAGENT_SPAWN_TIMEOUT_ACTIONABLE_ERROR
+      : summarizeError(startError);
     return {
       status: "error",
       error: messageText,
