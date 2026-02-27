@@ -8,6 +8,7 @@ import {
   setSessionsSpawnConfigOverride,
 } from "./openclaw-tools.subagents.sessions-spawn.test-harness.js";
 import { resetSubagentRegistryForTests } from "./subagent-registry.js";
+import { SUBAGENT_SPAWN_GATEWAY_TIMEOUT_MS } from "./subagent-spawn.js";
 
 const hookRunnerMocks = vi.hoisted(() => ({
   hasSubagentEndedHook: true,
@@ -52,6 +53,14 @@ function expectSessionsDeleteWithoutAgentStart() {
   const methods = getGatewayMethods();
   expect(methods).toContain("sessions.delete");
   expect(methods).not.toContain("agent");
+}
+
+function getFirstGatewayCallByMethod<T extends { method?: string }>(method: string): T | undefined {
+  const callGatewayMock = getCallGatewayMock();
+  const found = callGatewayMock.mock.calls.find(
+    (call) => (call[0] as { method?: string } | undefined)?.method === method,
+  );
+  return found?.[0] as T | undefined;
 }
 
 function mockAgentStartFailure() {
@@ -242,6 +251,10 @@ describe("sessions_spawn subagent lifecycle hooks", () => {
       key: details.childSessionKey,
       emitLifecycleHooks: false,
     });
+    const deleteCallWithTimeout = getFirstGatewayCallByMethod<{ timeoutMs?: number }>(
+      "sessions.delete",
+    );
+    expect(deleteCallWithTimeout?.timeoutMs).toBe(SUBAGENT_SPAWN_GATEWAY_TIMEOUT_MS);
   });
 
   it("returns error when thread binding is not marked ready", async () => {
@@ -353,6 +366,10 @@ describe("sessions_spawn subagent lifecycle hooks", () => {
       deleteTranscript: true,
       emitLifecycleHooks: false,
     });
+    const deleteCallWithTimeout = getFirstGatewayCallByMethod<{ timeoutMs?: number }>(
+      "sessions.delete",
+    );
+    expect(deleteCallWithTimeout?.timeoutMs).toBe(SUBAGENT_SPAWN_GATEWAY_TIMEOUT_MS);
   });
 
   it("falls back to sessions.delete cleanup when subagent_ended hook is unavailable", async () => {

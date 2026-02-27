@@ -8,10 +8,13 @@ import {
   setSessionsSpawnConfigOverride,
 } from "./openclaw-tools.subagents.sessions-spawn.test-harness.js";
 import { resetSubagentRegistryForTests } from "./subagent-registry.js";
-import { SUBAGENT_SPAWN_ACCEPTED_NOTE } from "./subagent-spawn.js";
+import {
+  SUBAGENT_SPAWN_ACCEPTED_NOTE,
+  SUBAGENT_SPAWN_GATEWAY_TIMEOUT_MS,
+} from "./subagent-spawn.js";
 
 const callGatewayMock = getCallGatewayMock();
-type GatewayCall = { method?: string; params?: unknown };
+type GatewayCall = { method?: string; params?: unknown; timeoutMs?: number };
 type SessionsSpawnConfigOverride = Parameters<typeof setSessionsSpawnConfigOverride>[0];
 
 function mockLongRunningSpawnFlow(params: {
@@ -303,5 +306,41 @@ describe("openclaw-tools: subagents (sessions_spawn model + thinking)", () => {
       runId: "run-1",
     });
     expect(spawnedTimeout).toBe(2);
+  });
+
+  it("uses the spawn gateway timeout for setup and launch calls", async () => {
+    const calls: GatewayCall[] = [];
+
+    callGatewayMock.mockImplementation(async (opts: unknown) => {
+      const request = opts as GatewayCall;
+      calls.push(request);
+      if (request.method === "agent") {
+        return { runId: "run-timeout", status: "accepted" };
+      }
+      return {};
+    });
+
+    const tool = await getSessionsSpawnTool({
+      agentSessionKey: "main",
+      agentChannel: "whatsapp",
+    });
+
+    const result = await tool.execute("call-timeout", {
+      task: "do thing",
+      model: "minimax/MiniMax-M2.1",
+      thinking: "off",
+    });
+    expect(result.details).toMatchObject({
+      status: "accepted",
+      runId: "run-timeout",
+    });
+
+    const spawnCalls = calls.filter(
+      (call) => call.method === "sessions.patch" || call.method === "agent",
+    );
+    expect(spawnCalls.length).toBeGreaterThan(0);
+    for (const call of spawnCalls) {
+      expect(call.timeoutMs).toBe(SUBAGENT_SPAWN_GATEWAY_TIMEOUT_MS);
+    }
   });
 });
