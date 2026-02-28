@@ -15,7 +15,12 @@ import {
 } from "./subagent-spawn.js";
 
 const callGatewayMock = getCallGatewayMock();
-type GatewayCall = { method?: string; params?: unknown; timeoutMs?: number };
+type GatewayCall = {
+  method?: string;
+  params?: unknown;
+  timeoutMs?: number;
+  forceLoopback?: boolean;
+};
 type SessionsSpawnConfigOverride = Parameters<typeof setSessionsSpawnConfigOverride>[0];
 
 function mockLongRunningSpawnFlow(params: {
@@ -342,6 +347,7 @@ describe("openclaw-tools: subagents (sessions_spawn model + thinking)", () => {
     expect(spawnCalls.length).toBeGreaterThan(0);
     for (const call of spawnCalls) {
       expect(call.timeoutMs).toBe(SUBAGENT_SPAWN_GATEWAY_TIMEOUT_MS);
+      expect(call.forceLoopback).toBe(true);
     }
   });
 
@@ -387,6 +393,7 @@ describe("openclaw-tools: subagents (sessions_spawn model + thinking)", () => {
     expect(spawnCalls.length).toBeGreaterThan(0);
     for (const call of spawnCalls) {
       expect(call.timeoutMs).toBe(45_000);
+      expect(call.forceLoopback).toBe(true);
     }
   });
 
@@ -422,6 +429,8 @@ describe("openclaw-tools: subagents (sessions_spawn model + thinking)", () => {
     const agentRequests = calls.filter((call) => call.method === "agent");
     const firstParams = agentRequests[0]?.params as { idempotencyKey?: string } | undefined;
     const secondParams = agentRequests[1]?.params as { idempotencyKey?: string } | undefined;
+    expect(agentRequests[0]?.forceLoopback).toBe(true);
+    expect(agentRequests[1]?.forceLoopback).toBe(true);
     expect(firstParams?.idempotencyKey).toBeTruthy();
     expect(secondParams?.idempotencyKey).toBe(firstParams?.idempotencyKey);
   });

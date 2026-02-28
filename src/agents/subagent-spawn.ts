@@ -338,6 +338,7 @@ export async function spawnSubagentDirect(
       method: "sessions.patch",
       params: { key: childSessionKey, spawnDepth: childDepth },
       timeoutMs: spawnGatewayTimeoutMs,
+      forceLoopback: true,
     });
   } catch (err) {
     const messageText =
@@ -355,6 +356,7 @@ export async function spawnSubagentDirect(
         method: "sessions.patch",
         params: { key: childSessionKey, model: resolvedModel },
         timeoutMs: spawnGatewayTimeoutMs,
+        forceLoopback: true,
       });
       modelApplied = true;
     } catch (err) {
@@ -376,6 +378,7 @@ export async function spawnSubagentDirect(
           thinkingLevel: thinkingOverride === "off" ? null : thinkingOverride,
         },
         timeoutMs: spawnGatewayTimeoutMs,
+        forceLoopback: true,
       });
     } catch (err) {
       const messageText =
@@ -408,6 +411,7 @@ export async function spawnSubagentDirect(
           method: "sessions.delete",
           params: { key: childSessionKey, emitLifecycleHooks: false },
           timeoutMs: spawnGatewayTimeoutMs,
+          forceLoopback: true,
         });
       } catch {
         // Best-effort cleanup only.
@@ -468,6 +472,7 @@ export async function spawnSubagentDirect(
           groupSpace: ctx.agentGroupSpace ?? undefined,
         },
         timeoutMs: spawnGatewayTimeoutMs,
+        forceLoopback: true,
       });
       if (typeof response?.runId === "string" && response.runId) {
         childRunId = response.runId;
@@ -535,6 +540,7 @@ export async function spawnSubagentDirect(
             emitLifecycleHooks: !endedHookEmitted,
           },
           timeoutMs: spawnGatewayTimeoutMs,
+          forceLoopback: true,
         });
       } catch {
         // Best-effort only.
